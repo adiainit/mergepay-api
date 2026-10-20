@@ -1,0 +1,293 @@
+/**
+ * Issue #810 — Stellar Horizon error mapping.
+ *
+ * These tests pin the translation from raw SDK/Horizon failures to the
+ * repository's client-safe error envelope: known transaction and operation
+ * result codes map to a stable API code, an appropriate HTTP status, and an
+ * actionable hint; unrecognized codes still yield `PROVIDER_REJECTED` while
+ * preserving only validated result-code tokens; unrelated errors are left
+ * alone.
+ */
+import { describe, expect, it } from "vitest";
+import { xdr } from "@stellar/stellar-sdk";
+import {
+  enumNameToResultCode,
+  mapHorizonError,
+} from "../src/services/horizon-errors";
+import { TransportError, toProviderError } from "../src/services/timeout";
+import { ProviderError } from "../src/lib/provider-error";
+
+/** Build a base64 TransactionResult carrying the given top-level verdict. */
+function resultXdr(result: xdr.TransactionResultResult): string {
+  return new xdr.TransactionResult({
+    feeCharged: xdr.Int64.fromString("100"),
+    result,
+    ext: xdr.TransactionResultExt.fromXDR(Buffer.alloc(4)),
+  }).toXDR("base64");
+}
+
+/** The shape the Stellar SDK attaches to rejected submissions. */
+function sdkError(data: Record<string, unknown>) {
+  return { response: { status: 400, data } };
+}
+
+describe("mapHorizonError", () => {
+  it("maps a transaction-level result code to its API code and status", () => {
+    const mapping = mapHorizonError(
+      sdkError({
+        type: "https://stellar.org/horizon-errors/transaction_failed",
+        extras: { result_codes: { transaction: "tx_bad_seq" } },
+      })
+    );
+
+    expect(mapping).toEqual({
+      status: 409,
+      code: "STELLAR_SEQUENCE_CONFLICT",
+      message: "The Stellar account sequence is out of date.",
+      hint: "Refresh the account and rebuild the transaction before signing again.",
+      resultCodes: ["tx_bad_seq"],
+    });
+  });
+
+  it("maps the failing operation when the transaction verdict is tx_failed", () => {
+    const mapping = mapHorizonError(
+      sdkError({
+        extras: {
+          result_codes: {
+            transaction: "tx_failed",
+            operations: ["op_underfunded"],
+          },
+        },
+      })
+    );
+
+    expect(mapping).toMatchObject({
+      status: 422,
+      code: "STELLAR_INSUFFICIENT_FUNDS",
+    });
+    expect(mapping?.resultCodes).toEqual(["tx_failed", "op_underfunded"]);
+  });
+
+  it("derives the transaction verdict from a base64 result_xdr", () => {
+    const mapping = mapHorizonError(
+      sdkError({
+        extras: { result_xdr: resultXdr(xdr.TransactionResultResult.txBadSeq()) },
+      })
+    );
+
+    expect(mapping).toMatchObject({
+      status: 409,
+      code: "STELLAR_SEQUENCE_CONFLICT",
+    });
+    expect(mapping?.resultCodes).toEqual(["tx_bad_seq"]);
+  });
+
+  it("prefers the result_xdr verdict over conflicting result codes", () => {
+    const mapping = mapHorizonError(
+      sdkError({
+        extras: {
+          result_codes: { transaction: "tx_insufficient_fee" },
+          result_xdr: resultXdr(xdr.TransactionResultResult.txBadSeq()),
+        },
+      })
+    );
+
+    expect(mapping).toMatchObject({
+      status: 409,
+      code: "STELLAR_SEQUENCE_CONFLICT",
+    });
+    expect(mapping?.resultCodes).toEqual(["tx_bad_seq", "tx_insufficient_fee"]);
+  });
+
+  it("falls back to PROVIDER_REJECTED for codes it does not know", () => {
+    const mapping = mapHorizonError(
+      sdkError({ extras: { result_codes: { operations: ["op_spam"] } } })
+    );
+
+    expect(mapping).toEqual({
+      status: 502,
+      code: "PROVIDER_REJECTED",
+      message: "Stellar rejected the transaction.",
+      hint: "Review the transaction result codes before submitting a corrected transaction.",
+      resultCodes: ["op_spam"],
+    });
+  });
+
+  it("drops non-token values so upstream payloads cannot leak", () => {
+    const mapping = mapHorizonError(
+      sdkError({
+        extras: {
+          result_codes: {
+            transaction: "tx_failed",
+            operations: [
+              "op_underfunded",
+              "See https://horizon.example.com/?secret=1",
+              42,
+              { nested: "value" },
+            ],
+          },
+        },
+      })
+    );
+
+    expect(mapping?.resultCodes).toEqual(["tx_failed", "op_underfunded"]);
+    expect(mapping?.message).not.toContain("horizon.example.com");
+  });
+
+  it("de-duplicates repeated codes", () => {
+    const mapping = mapHorizonError(
+      sdkError({
+        extras: {
+          result_codes: {
+            transaction: "tx_failed",
+            operations: ["op_underfunded", "op_underfunded"],
+          },
+        },
+      })
+    );
+
+    expect(mapping?.resultCodes).toEqual(["tx_failed", "op_underfunded"]);
+  });
+
+  it("accepts result codes stashed at the top level of the response body", () => {
+    const mapping = mapHorizonError(
+      sdkError({ result_codes: { transaction: "tx_too_late" } })
+    );
+
+    expect(mapping).toMatchObject({
+      status: 422,
+      code: "STELLAR_TRANSACTION_EXPIRED",
+    });
+  });
+
+  it("returns null for errors that are not structured Horizon rejections", () => {
+    expect(mapHorizonError(new Error("socket hang up"))).toBeNull();
+    expect(mapHorizonError({ response: { status: 503 } })).toBeNull();
+    expect(mapHorizonError({ response: { data: {} } })).toBeNull();
+    expect(mapHorizonError(null)).toBeNull();
+  });
+
+  it("returns null when result_xdr is not valid XDR", () => {
+    expect(
+      mapHorizonError(sdkError({ extras: { result_xdr: "not-xdr" } }))
+    ).toBeNull();
+  });
+
+  it("maps operation-level funding and trustline failures", () => {
+    const cases: Array<[string, number, string]> = [
+      ["op_no_trust", 422, "STELLAR_MISSING_TRUSTLINE"],
+      ["op_src_no_trust", 422, "STELLAR_MISSING_TRUSTLINE"],
+      ["op_no_destination", 422, "STELLAR_DESTINATION_INVALID"],
+      ["op_line_full", 422, "STELLAR_TRUSTLINE_LIMIT"],
+      ["op_low_reserve", 422, "STELLAR_INSUFFICIENT_FUNDS"],
+    ];
+
+    for (const [code, status, apiCode] of cases) {
+      const mapping = mapHorizonError(
+        sdkError({ extras: { result_codes: { operations: [code] } } })
+      );
+      expect(mapping, code).toMatchObject({ status, code: apiCode });
+    }
+  });
+});
+
+describe("enumNameToResultCode", () => {
+  it("converts XDR enum member names to Horizon result codes", () => {
+    expect(enumNameToResultCode("txBadSeq")).toBe("tx_bad_seq");
+    expect(enumNameToResultCode("txTooLate")).toBe("tx_too_late");
+    expect(enumNameToResultCode("txInsufficientFee")).toBe(
+      "tx_insufficient_fee"
+    );
+    expect(enumNameToResultCode("txBadMinSeqAgeOrGap")).toBe(
+      "tx_bad_min_seq_age_or_gap"
+    );
+    expect(enumNameToResultCode("opUnderfunded")).toBe("op_underfunded");
+    expect(enumNameToResultCode("txSuccess")).toBe("tx_success");
+  });
+});
+
+describe("toProviderError with Horizon result codes", () => {
+  const ctx = {
+    provider: "horizon",
+    operation: "Horizon.submitTransaction",
+    fallbackMessage: "Stellar rejected the transaction",
+  };
+
+  it("promotes a mapped rejection onto the ProviderError status, code and details", () => {
+    const converted = toProviderError(
+      sdkError({ extras: { result_codes: { transaction: "tx_bad_seq" } } }),
+      ctx
+    );
+
+    expect(converted).toBeInstanceOf(ProviderError);
+    const providerError = converted as ProviderError;
+    expect(providerError.status).toBe(409);
+    expect(providerError.code).toBe("STELLAR_SEQUENCE_CONFLICT");
+    expect(providerError.category).toBe("rejected");
+    expect(providerError.retryable).toBe(false);
+    expect(providerError.detail).toEqual(["tx_bad_seq"]);
+    expect(providerError.details).toEqual({
+      hint: "Refresh the account and rebuild the transaction before signing again.",
+      resultCodes: ["tx_bad_seq"],
+    });
+    expect(providerError.message).toContain("tx_bad_seq");
+  });
+
+  it("does not leak the raw upstream payload into the message", () => {
+    const converted = toProviderError(
+      sdkError({
+        title: "Transaction Failed",
+        detail: "secret material in the upstream body",
+        extras: { result_codes: { transaction: "tx_bad_auth" } },
+      }),
+      ctx
+    );
+
+    expect(converted.message).not.toContain("upstream body");
+    expect(converted.message).not.toContain("Transaction Failed");
+  });
+
+  it("does not apply Horizon mappings to another provider", () => {
+    const converted = toProviderError(
+      sdkError({ extras: { result_codes: { transaction: "tx_bad_seq" } } }),
+      {
+        provider: "anchor",
+        operation: "Anchor.submit",
+        fallbackMessage: "Anchor rejected the request",
+      }
+    );
+
+    expect(converted.status).toBe(502);
+    expect(converted.code).toBe("PROVIDER_REJECTED");
+  });
+
+  it("keeps a 429 without result codes classified as rate limited", () => {
+    const error = {
+      response: {
+        status: 429,
+        headers: { "retry-after": "7" },
+        data: { extras: {} },
+      },
+    };
+    const converted = toProviderError(error, ctx) as ProviderError;
+
+    expect(converted.category).toBe("rate_limited");
+    expect(converted.status).toBe(503);
+    expect(converted.code).toBe("SERVICE_UNAVAILABLE");
+    expect(converted.retryAfterSeconds).toBe(7);
+  });
+
+  it("unwraps a TransportError to reach the Horizon response", () => {
+    const cause = sdkError({
+      extras: { result_codes: { operations: ["op_underfunded"] } },
+    });
+    const transport = new TransportError("Horizon.submitTransaction", cause);
+
+    const converted = toProviderError(transport, ctx) as ProviderError;
+
+    expect(converted).toBeInstanceOf(ProviderError);
+    expect(converted.category).toBe("rejected");
+    expect(converted.status).toBe(422);
+    expect(converted.code).toBe("STELLAR_INSUFFICIENT_FUNDS");
+  });
+});

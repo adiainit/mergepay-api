@@ -12,6 +12,7 @@ import {
   retryAfterSeconds,
   type ProviderFailureCategory,
 } from "../lib/provider-error";
+import { mapHorizonError } from "./horizon-errors";
 
 // ─── Error types ────────────────────────────────────────────────────────────
 
@@ -248,26 +249,6 @@ function statusOf(error: unknown): number | null {
  * SDK error. These are safe provider identifiers — the only part of an
  * upstream error allowed to survive into a client message or ordinary log.
  */
-function resultCodesOf(error: unknown): string[] | null {
-  if (!error || typeof error !== "object") return null;
-  const data = (error as {
-    response?: { data?: { extras?: { result_codes?: unknown }; result_codes?: unknown } };
-  }).response?.data;
-  const raw = data?.extras?.result_codes ?? data?.result_codes;
-  if (!raw || typeof raw !== "object") return null;
-  const values = Object.values(raw).flatMap((value) => {
-    // `operations` arrives as an array of code strings; anything else that is
-    // not a plain string is dropped rather than stringified.
-    if (Array.isArray(value)) {
-      return value.filter(
-        (entry): entry is string => typeof entry === "string",
-      );
-    }
-    return typeof value === "string" ? [value] : [];
-  });
-  return values.length > 0 ? values : null;
-}
-
 export interface ProviderCallContext {
   /** Stable provider identifier, e.g. "horizon" or "anchor". */
   provider: string;
@@ -307,7 +288,8 @@ export function toProviderError(
   const upstreamError = error instanceof TransportError && statusOf(error.cause) !== null
     ? error.cause
     : error;
-  const codes = resultCodesOf(upstreamError);
+  const horizonMapping = ctx.provider === "horizon" ? mapHorizonError(upstreamError) : null;
+  const codes = horizonMapping?.resultCodes ?? null;
   const status = statusOf(upstreamError);
   const category: ProviderFailureCategory = codes
     ? "rejected"
@@ -322,9 +304,18 @@ export function toProviderError(
   return new ProviderError({
     provider: ctx.provider,
     operation: ctx.operation,
-    message: ctx.fallbackMessage,
+    // A recognized ledger rejection gets the mapping's descriptive message;
+    // everything else keeps the caller's generic fallback text.
+    message: horizonMapping?.message ?? ctx.fallbackMessage,
     category,
     detail: codes ?? undefined,
+    ...(horizonMapping
+      ? {
+          status: horizonMapping.status,
+          errorCode: horizonMapping.code,
+          details: { hint: horizonMapping.hint, resultCodes: horizonMapping.resultCodes },
+        }
+      : {}),
     retryAfterSeconds: category === "rate_limited" && ctx.provider === "horizon"
       ? retryAfterSeconds(upstreamError)
       : undefined,

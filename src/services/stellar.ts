@@ -561,12 +561,24 @@ async function submitToHorizon(tx: Transaction): Promise<string> {
   try {
     const res = await withHorizonFailover((horizon) => horizon.submitTransaction(tx));
     return res.hash;
-  } catch (e: any) {
-    const codes =
-      e?.response?.data?.extras?.result_codes ??
-      e?.response?.data?.result_codes;
-    const detail = codes ? JSON.stringify(codes) : e?.message ?? "submit failed";
-    throw Errors.upstream(`Stellar rejected the transaction: ${detail}`);
+  } catch (e: unknown) {
+    // Route every Horizon rejection through the shared mapping (#810) so the
+    // failure carries a stable API code, a ledger-appropriate status, and an
+    // actionable hint. Only validated result-code tokens survive; the raw
+    // SDK error and its response payload never reach the client.
+    const converted = toProviderError(e, {
+      provider: "horizon",
+      operation: "Horizon.submitTransaction",
+      fallbackMessage: "Stellar rejected the transaction",
+    });
+    if (converted instanceof ProviderError) {
+      logHorizonFailure(
+        converted.operation,
+        converted.category,
+        converted.detail?.join(",") ?? null
+      );
+    }
+    throw converted;
   }
 }
 

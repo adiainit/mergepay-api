@@ -78,6 +78,10 @@ export interface ProviderErrorParams {
   detail?: unknown;
   /** Safe client retry guidance from the provider's Retry-After header. */
   retryAfterSeconds?: number;
+  /** Optional code-specific response mapping for permanent provider rejections. */
+  status?: number;
+  errorCode?: string;
+  details?: unknown;
 }
 
 /**
@@ -133,15 +137,16 @@ export class ProviderError extends AppError {
             : { retryAfterSeconds: params.retryAfterSeconds }),
         }
       : undefined;
+    const errorDetails = details ?? params.details;
     super(
-      horizonRateLimited ? 503 : 502,
-      params.category === "rejected"
+      horizonRateLimited ? 503 : params.status ?? 502,
+      params.errorCode ?? (params.category === "rejected"
         ? ErrorCode.PROVIDER_REJECTED
         : horizonRateLimited
           ? ErrorCode.SERVICE_UNAVAILABLE
-          : ErrorCode.UPSTREAM_ERROR,
+          : ErrorCode.UPSTREAM_ERROR),
       detail ? `${params.message}: ${detail}` : params.message,
-      details,
+      errorDetails,
     );
     this.name = "ProviderError";
     this.category = params.category;

@@ -78,7 +78,16 @@ describe("toProviderError", () => {
     };
     const err = toProviderError(sdkError, ctx) as ProviderError;
     expect(err.category).toBe("rejected");
-    expect(err.code).toBe("PROVIDER_REJECTED");
+    // Issue #810: a recognized ledger rejection carries its dedicated API code
+    // and an appropriate HTTP status instead of the generic PROVIDER_REJECTED.
+    expect(err.code).toBe("STELLAR_SEQUENCE_CONFLICT");
+    expect(err.status).toBe(409);
+    expect(err.retryable).toBe(false);
+    expect(err.details).toMatchObject({
+      hint: expect.any(String),
+      resultCodes: ["tx_bad_seq", "op_underfunded"],
+    });
+    // Only the validated result-code tokens survive into the message.
     expect(err.message).toContain("tx_bad_seq");
     expect(err.message).toContain("op_underfunded");
     // The raw upstream payload must never leak into the client-facing message.
@@ -275,17 +284,25 @@ describe("stellar submission rejection (mocked Horizon)", () => {
     await expect(stellar.submitSigned(tx.toXDR())).rejects.toMatchObject({
       name: "ProviderError",
       category: "rejected",
-      code: "PROVIDER_REJECTED",
+      // Issue #810: tx_bad_seq maps onto its dedicated API code and status.
+      code: "STELLAR_SEQUENCE_CONFLICT",
+      status: 409,
     });
 
+    let thrown: unknown;
     try {
       await stellar.submitSigned(tx.toXDR());
-    } catch (err: any) {
-      expect(err.message).toContain("Stellar rejected the transaction");
-      expect(err.message).toContain("tx_bad_seq");
-      expect(classifyJobFailure(err)).toBe("permanent");
-      expect(JSON.stringify(err.message)).not.toContain("AAAA");
+    } catch (err) {
+      thrown = err;
     }
+    expect(thrown).toBeInstanceOf(ProviderError);
+    const rejection = thrown as ProviderError;
+    // The mapped, client-safe message plus the validated result-code tokens —
+    // never the caller's generic fallback text or the raw SDK payload.
+    expect(rejection.message).toContain("sequence is out of date");
+    expect(rejection.message).toContain("tx_bad_seq");
+    expect(classifyJobFailure(rejection)).toBe("permanent");
+    expect(JSON.stringify(rejection.message)).not.toContain("AAAA");
 
     submitSpy.mockRestore();
   });
