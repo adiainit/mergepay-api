@@ -195,6 +195,25 @@ describe("SEP-10 authentication integration", () => {
     expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
   });
 
+  it("rejects a correctly signed challenge bound to a different web auth domain", async () => {
+    const client = Keypair.random();
+    const transaction = WebAuth.buildChallengeTx(
+      serverKeypair(),
+      client.publicKey(),
+      config.SEP10_HOME_DOMAIN,
+      300,
+      config.networkPassphrase,
+      "other-client.example.com"
+    );
+    const signedXdr = signChallenge(transaction, client);
+
+    const response = await verifyEnvelope(signedXdr);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
   it("rejects an expired challenge with a 401 CHALLENGE_EXPIRED error", async () => {
     const client = Keypair.random();
     const transaction = WebAuth.buildChallengeTx(
@@ -223,6 +242,45 @@ describe("SEP-10 authentication integration", () => {
     const signedXdr = transaction.toXDR();
 
     const response = await verifyEnvelope(signedXdr);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unsigned challenge that carries only the server's signature", async () => {
+    const client = Keypair.random();
+    const challenge = await requestChallenge(client.publicKey());
+
+    // The server-signed challenge is exactly what a wallet receives before
+    // signing. Submitting it untouched proves the client's signature is
+    // genuinely required, not merely that a valid envelope was produced.
+    const response = await verifyEnvelope(challenge.json().transaction as string);
+
+    expect(response.statusCode).toBe(401);
+    expect(response.json().code).toBe("UNAUTHORIZED");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects a verified envelope whose home_domain request claim does not match", async () => {
+    const client = Keypair.random();
+    const challenge = await requestChallenge(client.publicKey());
+    const signedXdr = signChallenge(challenge.json().transaction, client);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/auth/verify",
+      remoteAddress: remoteAddress(),
+      payload: { transaction: signedXdr, home_domain: "other-anchor.example.com" },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json().code).toBe("HOME_DOMAIN_MISMATCH");
+    expect(mocks.prisma.user.upsert).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unparseable envelope before touching the user store", async () => {
+    const response = await verifyEnvelope("AAAAAA==");
 
     expect(response.statusCode).toBe(401);
     expect(response.json().code).toBe("UNAUTHORIZED");
