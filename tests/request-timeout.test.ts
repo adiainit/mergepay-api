@@ -138,7 +138,12 @@ describe("request timeout", () => {
     expect(timedOut).toHaveLength(1);
     expect(timedOut[0].timeoutMs).toBe(TIMEOUT_MS);
     expect(timedOut[0].method).toBe("GET");
-  }, 2000);
+    // Runner patience only: the assertions above pin the server's 80ms
+    // behaviour, but under full-suite parallel load the wall clock stretches
+    // well past the injection's own latency (the slow handler keeps running
+    // until SLOW_HANDLER_MS). The budget for the behaviour under test stays
+    // TIMEOUT_MS regardless.
+  }, 10_000);
 
   it("never arms a late timeout for a request that finished inside its budget", async () => {
     const res = await app.inject({
@@ -154,7 +159,7 @@ describe("request timeout", () => {
     // try to answer an already-completed request, and leave a log line.
     await sleep(TIMEOUT_MS * 3);
     expect(timeoutLinesFor("req-fast-test")).toHaveLength(0);
-  }, 2000);
+  }, 10_000);
 
   it("bounds the operational health route like any other request", async () => {
     const res = await app.inject({
