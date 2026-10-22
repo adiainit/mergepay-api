@@ -19,6 +19,7 @@ vi.mock("../src/services/network", () => ({
 }));
 
 import { buildApp } from "../src/app";
+import { buildLoggerOptions } from "../src/lib/logger";
 import { clearReadinessCache } from "../src/services/health";
 
 let app: Awaited<ReturnType<typeof buildApp>>;
@@ -75,6 +76,33 @@ describe("GET /health", () => {
       timestamp: expect.any(String),
     });
   }, 6000);
+
+  it("logs a structured warning once for a degraded readiness result", async () => {
+    const lines: Record<string, unknown>[] = [];
+    const capture = {
+      write(chunk: string) {
+        lines.push(JSON.parse(chunk));
+      },
+    };
+    const loggingApp = await buildApp({
+      logger: { ...buildLoggerOptions({ level: "warn" }), stream: capture },
+    });
+    h.queryRawUnsafe.mockRejectedValueOnce(new Error("connection dropped"));
+    clearReadinessCache();
+
+    const first = await loggingApp.inject({ method: "GET", url: "/health" });
+    const second = await loggingApp.inject({ method: "GET", url: "/health" });
+
+    expect(first.statusCode).toBe(503);
+    expect(second.statusCode).toBe(503);
+    const warnings = lines.filter(
+      (line) => line.msg === "Health readiness check is degraded"
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatchObject({ databaseConnected: false });
+
+    await loggingApp.close();
+  });
 });
 
 describe("GET /health/deep", () => {
